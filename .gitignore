@@ -1,0 +1,6 @@
+node_modules/
+.env
+contato.db
+contato.db-wal
+contato.db-shm
+.DS_Store
