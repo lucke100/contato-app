@@ -1,5 +1,6 @@
+require('dotenv').config();
 const express = require('express');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
 
@@ -8,11 +9,11 @@ const path = require('path');
 // ============================
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// Credenciais de acesso ao painel (altere aqui)
-const ADMIN_USER = 'admin';
-const ADMIN_PASSWORD = 'admin123';
+// Credenciais de acesso ao painel (podem vir de variáveis de ambiente)
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
 // Middleware
 app.use(cors());
@@ -20,34 +21,49 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================
-// BANCO DE DADOS (SQLite)
+// BANCO DE DADOS (PostgreSQL)
 // ============================
 
-const db = new Database(path.join(__dirname, 'contato.db'));
+// A Vercel/Neon/Supabase vai injetar a variável automaticamente
+// A Vercel Postgres usa especificamente POSTGRES_URL
+const dbUrl = process.env.POSTGRES_URL || process.env.DATABASE_URL;
 
-// Ativar WAL para melhor performance
-db.pragma('journal_mode = WAL');
+const pool = new Pool({
+    connectionString: dbUrl,
+    ssl: dbUrl && dbUrl.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 
-// Criar tabela se não existir
-db.exec(`
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nome TEXT NOT NULL,
-        telefone TEXT NOT NULL,
-        recado TEXT NOT NULL,
-        data TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-        lido INTEGER NOT NULL DEFAULT 0
-    )
-`);
-
-console.log('✅ Banco de dados SQLite conectado e tabela criada.');
+// Criar tabela se não existir (PostgreSQL)
+async function initDb() {
+    try {
+        if (!dbUrl) {
+            console.log('⚠️ DATABASE_URL ou POSTGRES_URL não definida. O banco de dados não foi inicializado.');
+            return;
+        }
+        
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                nome TEXT NOT NULL,
+                telefone TEXT NOT NULL,
+                recado TEXT NOT NULL,
+                data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                lido INTEGER NOT NULL DEFAULT 0
+            )
+        `);
+        console.log('✅ Banco de dados PostgreSQL conectado e tabela criada.');
+    } catch (err) {
+        console.error('❌ Erro ao inicializar o PostgreSQL:', err);
+    }
+}
+initDb();
 
 // ============================
 // ROTAS DA API
 // ============================
 
 // POST /api/messages - Enviar novo recado (público)
-app.post('/api/messages', (req, res) => {
+app.post('/api/messages', async (req, res) => {
     const { nome, telefone, recado } = req.body;
 
     if (!nome || !telefone || !recado) {
@@ -59,13 +75,15 @@ app.post('/api/messages', (req, res) => {
     }
 
     try {
-        const stmt = db.prepare('INSERT INTO messages (nome, telefone, recado) VALUES (?, ?, ?)');
-        const result = stmt.run(nome.trim(), telefone.trim(), recado.trim());
+        const result = await pool.query(
+            'INSERT INTO messages (nome, telefone, recado) VALUES ($1, $2, $3) RETURNING id',
+            [nome.trim(), telefone.trim(), recado.trim()]
+        );
 
         res.status(201).json({
             success: true,
             message: 'Recado enviado com sucesso!',
-            id: result.lastInsertRowid
+            id: result.rows[0].id
         });
     } catch (err) {
         console.error('Erro ao salvar mensagem:', err);
@@ -78,7 +96,6 @@ app.post('/api/login', (req, res) => {
     const { user, password } = req.body;
 
     if (user === ADMIN_USER && password === ADMIN_PASSWORD) {
-        // Em produção, usar JWT ou sessões. Aqui usamos token simples.
         const token = Buffer.from(`${ADMIN_USER}:${Date.now()}`).toString('base64');
         res.json({ success: true, token });
     } else {
@@ -110,21 +127,20 @@ function authMiddleware(req, res, next) {
 }
 
 // GET /api/messages - Listar recados (protegido)
-app.get('/api/messages', authMiddleware, (req, res) => {
+app.get('/api/messages', authMiddleware, async (req, res) => {
     try {
-        const messages = db.prepare('SELECT * FROM messages ORDER BY id DESC').all();
-
-        // Contar recados de hoje
-        const today = new Date().toISOString().split('T')[0];
-        const todayCount = db.prepare(
-            "SELECT COUNT(*) as count FROM messages WHERE date(data) = ?"
-        ).get(today);
+        const messagesResult = await pool.query('SELECT * FROM messages ORDER BY id DESC');
+        
+        // Contar recados de hoje (PostgreSQL)
+        const todayCountResult = await pool.query(
+            "SELECT COUNT(*) as count FROM messages WHERE DATE(data) = CURRENT_DATE"
+        );
 
         res.json({
-            messages,
+            messages: messagesResult.rows,
             stats: {
-                total: messages.length,
-                today: todayCount.count
+                total: messagesResult.rows.length,
+                today: parseInt(todayCountResult.rows[0].count)
             }
         });
     } catch (err) {
@@ -134,10 +150,9 @@ app.get('/api/messages', authMiddleware, (req, res) => {
 });
 
 // PATCH /api/messages/:id/read - Marcar como lido (protegido)
-app.patch('/api/messages/:id/read', authMiddleware, (req, res) => {
+app.patch('/api/messages/:id/read', authMiddleware, async (req, res) => {
     try {
-        const stmt = db.prepare('UPDATE messages SET lido = 1 WHERE id = ?');
-        stmt.run(req.params.id);
+        await pool.query('UPDATE messages SET lido = 1 WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (err) {
         console.error('Erro ao atualizar mensagem:', err);
@@ -146,9 +161,9 @@ app.patch('/api/messages/:id/read', authMiddleware, (req, res) => {
 });
 
 // DELETE /api/messages - Apagar todos os recados (protegido)
-app.delete('/api/messages', authMiddleware, (req, res) => {
+app.delete('/api/messages', authMiddleware, async (req, res) => {
     try {
-        db.prepare('DELETE FROM messages').run();
+        await pool.query('DELETE FROM messages');
         res.json({ success: true, message: 'Todos os recados foram apagados.' });
     } catch (err) {
         console.error('Erro ao apagar mensagens:', err);
@@ -157,12 +172,11 @@ app.delete('/api/messages', authMiddleware, (req, res) => {
 });
 
 // DELETE /api/messages/:id - Apagar um recado específico (protegido)
-app.delete('/api/messages/:id', authMiddleware, (req, res) => {
+app.delete('/api/messages/:id', authMiddleware, async (req, res) => {
     try {
-        const stmt = db.prepare('DELETE FROM messages WHERE id = ?');
-        const result = stmt.run(req.params.id);
+        const result = await pool.query('DELETE FROM messages WHERE id = $1', [req.params.id]);
 
-        if (result.changes === 0) {
+        if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Recado não encontrado.' });
         }
 
@@ -183,11 +197,15 @@ app.use((req, res, next) => {
 });
 
 // ============================
-// INICIAR SERVIDOR
+// INICIAR SERVIDOR / VERCEL EXPORT
 // ============================
 
-app.listen(PORT, () => {
-    console.log(`\n🚀 Servidor rodando em http://localhost:${PORT}`);
-    console.log(`📋 Painel admin: http://localhost:${PORT} → clique em "Painel"`);
-    console.log(`🔑 Credenciais: ${ADMIN_USER} / ${ADMIN_PASSWORD}\n`);
-});
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+    app.listen(PORT, () => {
+        console.log(`\n🚀 Servidor rodando em http://localhost:${PORT}`);
+        console.log(`📋 Painel admin: http://localhost:${PORT}/admin`);
+    });
+}
+
+// Exportar para Vercel Serverless
+module.exports = app;
