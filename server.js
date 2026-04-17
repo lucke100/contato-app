@@ -34,29 +34,34 @@ const pool = new Pool({
 });
 
 // Criar tabela se não existir (PostgreSQL)
+let dbReady = null;
 async function initDb() {
-    try {
-        if (!dbUrl) {
-            console.log('⚠️ DATABASE_URL ou POSTGRES_URL não definida. O banco de dados não foi inicializado.');
-            return;
-        }
-        
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                nome TEXT NOT NULL,
-                telefone TEXT NOT NULL,
-                recado TEXT NOT NULL,
-                data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                lido INTEGER NOT NULL DEFAULT 0
-            )
-        `);
-        console.log('✅ Banco de dados PostgreSQL conectado e tabela criada.');
-    } catch (err) {
-        console.error('❌ Erro ao inicializar o PostgreSQL:', err);
+    if (!dbUrl) {
+        console.log('⚠️ DATABASE_URL ou POSTGRES_URL não definida. O banco de dados não foi inicializado.');
+        return;
     }
+    
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            nome TEXT NOT NULL,
+            telefone TEXT NOT NULL,
+            recado TEXT NOT NULL,
+            data TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            lido INTEGER NOT NULL DEFAULT 0
+        )
+    `);
+    console.log('✅ Banco de dados PostgreSQL conectado e tabela criada.');
 }
-initDb();
+dbReady = initDb().catch(err => console.error('❌ Erro ao inicializar o PostgreSQL:', err));
+
+// Middleware para garantir que o banco está pronto antes de qualquer request
+app.use(async (req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+        await dbReady;
+    }
+    next();
+});
 
 // ============================
 // ROTAS DA API
